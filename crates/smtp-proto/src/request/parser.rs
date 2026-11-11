@@ -432,6 +432,37 @@ impl<'x, 'y> Rfc5321Parser<'x, 'y> {
                     at_count += 1;
                     lp_len = self.len_excluding_current(&value);
                 }
+                b'[' if !in_quote && last_ch == b'@' && at_count == 1 => {
+                    // RFC 5321, Section 4.1.3: an address literal may replace the
+                    // domain in a mailbox. Keep the original text for RCPT rewriting.
+                    let input = self.bytes.as_slice();
+                    let Some(closing_bracket) = input.iter().position(|&ch| ch == b']') else {
+                        return Ok(None);
+                    };
+
+                    // An address literal must occupy the entire domain part.
+                    if input.get(closing_bracket + 1) != Some(&b'>') {
+                        return Ok(None);
+                    }
+
+                    let is_valid = from_utf8(&input[..closing_bracket]).is_ok_and(|literal| {
+                        if literal
+                            .get(..5)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("IPv6:"))
+                        {
+                            literal[5..].parse::<std::net::Ipv6Addr>().is_ok()
+                        } else {
+                            literal.parse::<std::net::Ipv4Addr>().is_ok()
+                        }
+                    });
+                    if !is_valid {
+                        return Ok(None);
+                    }
+
+                    // Advance over the literal, including ']', without changing
+                    // the zero-copy address value. The next iteration reads '>'.
+                    *self.bytes = input[closing_bracket + 1..].iter();
+                }
                 b'>' if !in_quote => {
                     self.stop_char = ch;
                     self.flush_excluding_current(&mut value);
@@ -1437,3 +1468,63 @@ struct MaybeZeroCopy<'y> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/smtp-proto/src/request/parser/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod address_literal_tests {
+    use super::*;
+
+    #[test]
+    fn parses_ip_address_literals_in_mail_and_rcpt() {
+        for address in [
+            "nahida@[45.146.4.191]",
+            "nahida@[192.0.2.1]",
+            "nahida@[IPv6:2001:db8::1]",
+            "nahida@[IPv6:::1]",
+            "nahida@[ipv6:2001:db8::1]",
+        ] {
+            for command in [
+                format!("RCPT TO:<{address}>\r\n"),
+                format!("MAIL FROM:<{address}>\r\n"),
+            ] {
+                let mut input = command.as_bytes().iter();
+                match Request::parse(&mut input).unwrap() {
+                    Request::Rcpt { to } => assert_eq!(to.address, address),
+                    Request::Mail { from } => assert_eq!(from.address, address),
+                    other => panic!("unexpected SMTP request: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_ip_address_literals() {
+        for address in [
+            "nahida@[]",
+            "nahida@[45.146.4.999]",
+            "nahida@[IPv6:]",
+            "nahida@[IPv6:not-an-ip]",
+            "nahida@[::1]",
+            "nahida@[mail.example.com]",
+            "nahida@[192.0.2.1",
+            "nahida@[192.0.2.1]suffix",
+            "nahida@[192.0.2.1]@example.org",
+        ] {
+            let command = format!("RCPT TO:<{address}>\r\n");
+            let mut input = command.as_bytes().iter();
+            assert_eq!(
+                Request::parse(&mut input),
+                Err(Error::InvalidRecipientAddress),
+                "unexpected result for {address}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_mailboxes_still_parse() {
+        let mut input = b"RCPT TO:<nahida@example.org>\r\n".iter();
+        match Request::parse(&mut input).unwrap() {
+            Request::Rcpt { to } => assert_eq!(to.address, "nahida@example.org"),
+            other => panic!("unexpected SMTP request: {other:?}"),
+        }
+    }
+}
